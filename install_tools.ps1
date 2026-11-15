@@ -76,6 +76,48 @@ try {
         if (Get-AppxPackage -Name "*Kali*" -ErrorAction SilentlyContinue) { return $true }
         return $false
     }
+    # Full path of a REAL python.exe, or $null.
+    # "python" alone is often the Microsoft Store stub (prints "Python est introuvable"),
+    # so we try the "py" launcher first and check that the interpreter really runs.
+    function Find-Python {
+        $cands = @()
+        if (Get-Command py -ErrorAction SilentlyContinue) {
+            $r = & py -3 -c "import sys;print(sys.executable)" 2>$null
+            if ($LASTEXITCODE -eq 0 -and $r) { $cands += ($r | Select-Object -First 1).Trim() }
+        }
+        $cands += @(Get-ChildItem "$env:LOCALAPPDATA\Programs\Python", "$env:ProgramFiles\Python*" -Filter python.exe -Recurse -Depth 1 -ErrorAction SilentlyContinue | ForEach-Object { $_.FullName })
+        $g = Get-Command python -ErrorAction SilentlyContinue
+        if ($g -and $g.Source -notlike "*\WindowsApps\*") { $cands += $g.Source }
+        foreach ($c in $cands) {
+            if ($c -and (Test-Path $c)) {
+                & $c -c "import sys" 2>$null
+                if ($LASTEXITCODE -eq 0) { return $c }
+            }
+        }
+        return $null
+    }
+    # Is a program with this display name registered in Windows (Apps and features)?
+    function Test-Uninstall($motif) {
+        foreach ($k in "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*", "HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*", "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*") {
+            $f = Get-ItemProperty $k -ErrorAction SilentlyContinue | Where-Object { $_.DisplayName -like $motif } | Select-Object -First 1
+            if ($f) { return $true }
+        }
+        return $false
+    }
+    # Full path of $Marker in $Dir or up to 3 folder levels below it, else $null
+    function Find-Marker($Dir, $Marker) {
+        if (-not (Test-Path $Dir)) { return $null }
+        $level = @($Dir)
+        for ($i = 0; $i -lt 4; $i++) {
+            foreach ($d in $level) {
+                $c = Join-Path $d $Marker
+                if (Test-Path $c) { return $c }
+            }
+            $level = @($level | ForEach-Object { Get-ChildItem $_ -Directory -ErrorAction SilentlyContinue | ForEach-Object { $_.FullName } })
+            if (-not $level) { break }
+        }
+        return $null
+    }
     # Is a Start Menu shortcut matching this pattern present?
     function Test-StartMenu($motif) {
         foreach ($m in $startMenus) {
@@ -87,10 +129,11 @@ try {
     # Download the first release asset of a GitHub repo that matches a pattern, unzip it into $Dest.
     # Skipped if $Marker (a file name) already exists somewhere under $Dest.
     function Install-GitHubZip($Nom, $Repo, $Pattern, $Dest, $Marker) {
-        if ((Test-Path $Dest) -and (Get-ChildItem $Dest -Recurse -Filter $Marker -Depth 4 -ErrorAction SilentlyContinue | Select-Object -First 1)) {
-            Write-Host "[already installed] $Nom" -ForegroundColor Yellow; $script:deja += $Nom; return
+        $found = Find-Marker $Dest $Marker
+        if ($found) {
+            Write-Host "[already installed] $Nom ($found)" -ForegroundColor Yellow; $script:deja += $Nom; return
         }
-        Write-Host "[installing] $Nom (GitHub)..." -ForegroundColor Cyan
+        Write-Host "[installing] $Nom (GitHub)... ($Marker not found under $Dest)" -ForegroundColor Cyan
         $rel = Get-Json "https://api.github.com/repos/$Repo/releases/latest"
         $asset = $rel.assets | Where-Object { $_.name -like $Pattern } | Select-Object -First 1
         $zip = "$Tools\$Nom.zip"
@@ -111,7 +154,7 @@ try {
     # Ids = several ids are tried in order until one works (winget ids sometimes change)
     $apps = @(
         @{ Nom = "Git";           Ids = @("Git.Git");                          Cmd = "git" },
-        @{ Nom = "Python 3";      Ids = @("Python.Python.3.12");               Cmd = "python" },
+        @{ Nom = "Python 3";      Ids = @("Python.Python.3.12");               Cmd = "py" },
         @{ Nom = "Java";          Ids = @("Microsoft.OpenJDK.21");             Cmd = "java" },
         @{ Nom = "VS Code";       Ids = @("Microsoft.VisualStudioCode");       Cmd = "code" },
         @{ Nom = "7-Zip";         Ids = @("7zip.7zip");                        Cmd = "" },
@@ -213,14 +256,31 @@ exit $FAIL
 
     # ---------- 3. Python libraries (Windows) ----------
     $env:Path = $env:Path + ";" + [Environment]::GetEnvironmentVariable("Path","Machine") + ";" + [Environment]::GetEnvironmentVariable("Path","User")
-    if (Get-Command python -ErrorAction SilentlyContinue) {
-        $installed = (python -m pip list --format=freeze 2>$null) -replace "==.*", ""
+    # Real Python (works with "py" even if "python" is only the Microsoft Store stub)
+    $pyExe = Find-Python
+    if ($pyExe) { Write-Host "[python] Using $pyExe" -ForegroundColor Cyan }
+    if ($pyExe) {
+        & $pyExe -m pip install --upgrade pip --disable-pip-version-check --quiet --no-warn-script-location 2>$null
+        & $pyExe -m pip cache purge --disable-pip-version-check *> $null     # fixes the "Cache entry deserialization failed" warnings
+        # Make the Scripts folders of this Python visible, so tools like "pwn" can be detected
+        foreach ($d in (& $pyExe -c "import sysconfig,site,os;print(sysconfig.get_path('scripts'));print(os.path.join(site.getuserbase(),'Scripts'))" 2>$null)) {
+            if ($d -and (Test-Path $d) -and (($env:Path -split ";") -notcontains $d)) { $env:Path = "$env:Path;$d" }
+        }
+        $installed = (& $pyExe -m pip list --format=freeze 2>$null) -replace "==.*", ""
         foreach ($p in "requests","pwntools","beautifulsoup4","scapy","sqlmap","pycryptodome","sympy","pillow") {
-            if ($installed -contains $p) { Write-Host "[already installed] pip $p" -ForegroundColor Yellow; $deja += "pip $p" }
+            $already = $installed -contains $p
+            # pwntools may be installed elsewhere (another Python): the "pwn" command or "import pwn" is enough
+            if ($p -eq "pwntools" -and -not $already) {
+                if (Get-Command pwn -ErrorAction SilentlyContinue) { $already = $true }
+                else { & $pyExe -c "import pwn" *> $null; if ($LASTEXITCODE -eq 0) { $already = $true } }
+            }
+            if ($already) { Write-Host "[already installed] pip $p" -ForegroundColor Yellow; $deja += "pip $p" }
             else {
                 Write-Host "[pip] $p..." -ForegroundColor Cyan
-                python -m pip install $p
-                if ($LASTEXITCODE -eq 0) { $ok += "pip $p" } else { $echec += "pip $p" }
+                & $pyExe -m pip install --disable-pip-version-check --no-warn-script-location $p
+                if ($LASTEXITCODE -eq 0) { $ok += "pip $p" }
+                elseif ($p -eq "pwntools") { $echec += "pip pwntools (its unicorn dependency cannot be built on this Python version: use pwntools in Kali, it is installed there)" }
+                else { $echec += "pip $p" }
             }
         }
     } else { $echec += "pip (python not found, restart then run again)" }
@@ -262,11 +322,19 @@ exit $FAIL
     Install-GitHubZip "Ghidra" "NationalSecurityAgency/ghidra" "*.zip" "$Tools\Ghidra" "ghidraRun.bat"
     Install-GitHubZip "Cutter" "rizinorg/cutter" "*Windows*x86_64*.zip" "$Tools\Cutter" "cutter.exe"
 
-    $autopsyPresent = (Test-StartMenu "Autopsy*") -or (Get-ChildItem $env:ProgramFiles -Directory -Filter "Autopsy*" -ErrorAction SilentlyContinue | Select-Object -First 1)
-    if ($autopsyPresent) {
-        Write-Host "[already installed] Autopsy" -ForegroundColor Yellow; $deja += "Autopsy"
+    $autopsyWhere = $null
+    if (Test-Uninstall "Autopsy*") { $autopsyWhere = "Windows installed apps list" }
+    elseif (Test-StartMenu "Autopsy*") { $autopsyWhere = "Start Menu" }
+    else {
+        foreach ($pf in $env:ProgramFiles, ${env:ProgramFiles(x86)}, "$env:LOCALAPPDATA\Programs") {
+            $d = Get-ChildItem $pf -Directory -Filter "Autopsy*" -ErrorAction SilentlyContinue | Select-Object -First 1
+            if ($d) { $autopsyWhere = $d.FullName; break }
+        }
+    }
+    if ($autopsyWhere) {
+        Write-Host "[already installed] Autopsy ($autopsyWhere)" -ForegroundColor Yellow; $deja += "Autopsy"
     } else {
-        Write-Host "[installing] Autopsy (GitHub)..." -ForegroundColor Cyan
+        Write-Host "[installing] Autopsy (GitHub)... (not found in installed apps, Start Menu or Program Files)" -ForegroundColor Cyan
         $good = $false
         $rel = Get-Json "https://api.github.com/repos/sleuthkit/autopsy/releases/latest"
         $asset = $rel.assets | Where-Object { $_.name -like "*.msi" } | Select-Object -First 1
@@ -285,6 +353,32 @@ exit $FAIL
     Write-Host "[shortcuts] Building category folders..." -ForegroundColor Cyan
 
     $sep = " " + [char]0x00A6 + " "     # looks like a pipe (a real | is not allowed in file names)
+
+    # Helper used by the ExifTool shortcut: city found online from the GPS coordinates (always rewritten)
+    Set-Content -Path "$Tools\exifgeo.ps1" -Encoding UTF8 -Value @'
+# Prints the city found online (OpenStreetMap Nominatim) from the GPS coordinates of each file.
+# The coordinates are sent to nominatim.openstreetmap.org (needs internet).
+param([Parameter(ValueFromRemainingArguments = $true)] $Files)
+[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+foreach ($f in $Files) {
+    if (("$f" -like "-*") -or -not (Test-Path "$f" -PathType Leaf)) { continue }
+    $gps = @(& exiftool.exe -n -s3 -GPSLatitude -GPSLongitude "$f" 2>$null)
+    if ($gps.Count -lt 2) { continue }
+    $lat = ("$($gps[0])").Trim(); $lon = ("$($gps[1])").Trim()
+    try {
+        $u = "https://nominatim.openstreetmap.org/reverse?format=jsonv2&zoom=10&accept-language=fr&lat=$lat&lon=$lon"
+        $resp = Invoke-WebRequest $u -Headers @{ "User-Agent" = "RootMe-Tools/1.0" } -UseBasicParsing -TimeoutSec 15
+        $r = [Text.Encoding]::UTF8.GetString($resp.RawContentStream.ToArray()) | ConvertFrom-Json
+        $a = $r.address
+        $ville = @($a.city, $a.town, $a.village, $a.municipality, $a.county) | Where-Object { $_ } | Select-Object -First 1
+        Write-Host ""
+        Write-Host "Online city (OpenStreetMap) for $f : $ville" -ForegroundColor Green
+        Write-Host "  $($r.display_name)"
+    } catch {
+        Write-Host "Online lookup failed: $($_.Exception.Message)" -ForegroundColor Yellow
+    }
+}
+'@
 
     $manquants = @()
     $ws = New-Object -ComObject WScript.Shell
@@ -305,8 +399,10 @@ exit $FAIL
     Add-ExtraDir "exiftool" "exiftool*.exe"
     Add-ExtraDir "nmap" "nmap.exe"
     Add-ExtraDir "java" "java.exe"
-    if (Get-Command python -ErrorAction SilentlyContinue) {
-        foreach ($d in (python -c "import sysconfig,site,os;print(sysconfig.get_path('scripts'));print(os.path.join(site.getuserbase(),'Scripts'))" 2>$null)) {
+    $pyExe = Find-Python
+    if ($pyExe) {
+        $extra += (Split-Path $pyExe)
+        foreach ($d in (& $pyExe -c "import sysconfig,site,os;print(sysconfig.get_path('scripts'));print(os.path.join(site.getuserbase(),'Scripts'))" 2>$null)) {
             if ($d -and (Test-Path $d)) { $extra += $d }
         }
     }
@@ -351,9 +447,9 @@ exit $FAIL
     }
     # Windows terminal: banner with an example, opens in the Workspace folder
     function Add-Cmd($cat, $label, $example, $run) {
-        $cmd = "`$env:Path += ';$extraPath'; Set-Location '$Work'; Write-Host '$label' -ForegroundColor Green; Write-Host 'Example: $example'; Write-Host 'Your files go in: $Work'; Write-Host ''"
+        $cmd = "[Console]::OutputEncoding = [Text.Encoding]::UTF8; `$env:Path += ';$extraPath'; Set-Location '$Work'; Write-Host '$label' -ForegroundColor Green; Write-Host 'Example: $example'; Write-Host 'Your files go in: $Work'; Write-Host ''"
         if ($run) { $cmd += "; $run" }
-        New-Lnk (Join-Path (Get-Cat $cat) "$label.lnk") $psExe "-NoExit -Command `"$cmd`""
+        New-Lnk (Join-Path (Get-Cat $cat) "$label.lnk") $psExe "-NoExit -ExecutionPolicy Bypass -Command `"$cmd`""
     }
     # Kali terminal: banner with an example, opens in the Workspace folder
     function Add-Wsl($cat, $label, $example, $run) {
@@ -383,7 +479,7 @@ exit $FAIL
     Add-Wsl $c "Kali - Linux Terminal" "ls then cd to your files" ""
 
     $c = "01-Steganography${sep}Steganographie"
-    Add-Cmd $c "ExifTool - Read Metadata" "exiftool image.jpg" "function exiftool { & exiftool.exe -a -u -ee -api Geolocation -c '%.13f' `@args }; exiftool -ver"
+    Add-Cmd $c "ExifTool - Read Metadata" "exiftool image.jpg" "function exiftool { & exiftool.exe -a -u -ee -api Geolocation -c '%.13f' `@args; & '$Tools\exifgeo.ps1' `@args }; Write-Host 'Shows the ExifTool place name, then the city found online from the GPS coordinates'; exiftool -ver"
     if (Test-Path "$Tools\stegsolve.jar") { Add-Cmd $c "Stegsolve - Color Planes" "open your image with File then Open" "java -jar '$Tools\stegsolve.jar'" }
     else { Add-Missing $c "Stegsolve - Color Planes" "http://www.caesum.com/handbook/Stegsolve.jar" "Save Stegsolve.jar as $Tools\stegsolve.jar (needs Java)." }
     Add-Wsl $c "Steghide - Extract Hidden" "steghide extract -sf image.jpg" "steghide --version"
@@ -456,7 +552,7 @@ exit $FAIL
     Add-App $c "Burp - HTTP Proxy" "*Burp*" "BurpSuiteCommunity.exe" "https://portswigger.net/burp/communitydownload" ""
 
     Write-Host "Shortcuts in: $Racine" -ForegroundColor Green
-    if ($manquants) { Write-Host "Missing (a .txt with the download link was created instead): $($manquants -join ', ')" -ForegroundColor Yellow }
+    if ($manquants) { Write-Host "Missing (a .txt with the download link was created instead): $(($manquants | Select-Object -Unique) -join ', ')" -ForegroundColor Yellow }
     if (-not $distro) { Write-Host "No WSL distro found: Kali shortcuts will not work until Kali is installed (restart, then run the script again)." -ForegroundColor Yellow }
     Start-Process explorer.exe $Racine
 
