@@ -28,12 +28,14 @@ Les catégories sont triées de la plus accessible à la plus avancée. Au sein 
 **Ce qu'il met en place :**
 *   Programmes Windows via `winget` : Git, Python 3, Java, VS Code, 7-Zip, Audacity, ExifTool, Wireshark, Nmap, Burp Suite CE, x64dbg, VirtualBox.
 *   HxD n'est pas installé automatiquement (le serveur de téléchargement est instable) : le script crée un fichier `.txt` avec le lien dans les dossiers Stéganographie et Forensic, et le raccourci apparaît dès que tu l'as installé à la main puis relancé le script.
-*   Téléchargements GitHub : Ghidra, Cutter, Autopsy, Stegsolve, PayloadsAllTheThings, RsaCtfTool, PEASS-ng, Volatility 3, BeEF.
+*   Téléchargements GitHub : Ghidra, Cutter, Autopsy, Stegsolve, CyberChef (version hors ligne), PayloadsAllTheThings, RsaCtfTool, PEASS-ng, Volatility 3, BeEF.
 *   Kali Linux sous WSL 2 avec tous les outils Linux (steghide, binwalk, gobuster, ffuf, john, hashcat, gdb avec pwndbg, radare2, sqlmap, Metasploit, wordlists dont `rockyou.txt`, SecLists, pwntools...).
 *   Bibliothèques Python : requests, pwntools, beautifulsoup4, scapy, sqlmap, pycryptodome, sympy, pillow.
 *   Un dossier `RootMe-Tools\Categories` avec un sous-dossier par catégorie et des raccourcis prêts à l'emploi, plus un dossier `Workspace` où déposer les fichiers des épreuves.
 
 **Option :** SageMath (très lourd, utile pour la crypto avancée) s'active en passant `$InstallSage` à `$true` en haut du script.
+
+> ⚠️ **Smart App Control** (Windows 11) bloque les installeurs non signés comme ExifTool ou x64dbg, et il n'existe aucune exclusion possible. Le script te prévient s'il est actif. Pour continuer, désactive-le dans Sécurité Windows (Contrôle des applications et du navigateur, paramètres de Smart App Control), relance le script, puis réactive-le si ta version de Windows le permet.
 
 > ⚠️ Le dossier `Tools` est exclu de Windows Defender, car des outils comme PEASS-ng ou BeEF sont détectés comme malveillants. Le dossier `Workspace` n'est volontairement **pas** exclu : n'ouvre jamais un fichier d'épreuve douteux directement sur ta machine si tu n'es pas sûr de toi, utilise plutôt WSL ou une VM.
 
@@ -86,7 +88,7 @@ La majorité des outils de hacking sont pensés pour Linux. Sous Windows, tu as 
     *   **[Python 3](https://www.python.org/downloads/) :** le langage roi du hacking.
     *   **[VS Code](https://code.visualstudio.com/) :** éditeur pour écrire tes scripts.
     *   **Bibliothèques Python :** `requests` (web), `pwntools` / `socket` (réseau), `BeautifulSoup` (parsing HTML), `pycryptodome` (crypto).
-    *   **[CyberChef](https://gchq.github.io/CyberChef/) :** pour tester rapidement une chaîne de conversions avant de la coder.
+    *   **CyberChef (copie hors ligne, installée par le script) :** pour tester rapidement une chaîne de conversions avant de la coder. Raccourci dans `03-Programmation` et `06-Cryptanalyse`.
 *   **Concepts à maîtriser :** manipulation de chaînes (Base64, hexadécimal), boucles rapides, lecture de flux réseau (sockets), limites de temps des épreuves (le script doit répondre vite).
 
 ## 📡 4. Réseau (35 épreuves) 🟡
@@ -96,7 +98,8 @@ La majorité des outils de hacking sont pensés pour Linux. Sous Windows, tu as 
     *   **[Wireshark](https://www.wireshark.org/) :** analyseur visuel de captures de paquets `.pcap`.
     *   **[Nmap](https://nmap.org/) :** scanner de ports pour découvrir les services actifs.
     *   **Netcat (`nc`) :** le couteau suisse TCP/UDP (indispensable pour les reverse shells).
-    *   **Scapy (Python) :** bibliothèque pour forger des paquets réseau personnalisés de A à Z.
+    *   **Scapy (Python) :** bibliothèque pour forger des paquets réseau personnalisés de A à Z. Raccourci `Scapy - Packet Forging` pour le shell interactif.
+    *   **Scapy - Decode Hex Frame (raccourci dédié) :** pour les épreuves où Root-Me donne juste un bloc hexadécimal brut d'une trame (`00 05 73 a0 ...`). Le raccourci vérifie et installe `python3-scapy` tout seul si besoin (en root via `wsl -u root`, donc sans jamais demander le mot de passe de l'utilisateur Linux), puis tu colles le hex, ligne vide ou Ctrl+D → toutes les couches (Ethernet, IP/IPv6, TCP/UDP, payload HTTP/FTP/Telnet...) sont décodées et affichées automatiquement.
 *   **Concepts à maîtriser :** modèle OSI, poignée de main TCP (handshake), requêtes ARP/DNS, protocoles non chiffrés (Telnet, FTP, HTTP).
 
 ## 🌐 5. Web Serveur (97 épreuves) 🟡 à 🔴
@@ -114,9 +117,23 @@ La majorité des outils de hacking sont pensés pour Linux. Sous Windows, tu as 
 
 *   **Outils :**
     *   **[dCode.fr](https://www.dcode.fr/) :** en ligne, pour identifier et résoudre les chiffres historiques (César, Vigenère) et mathématiques.
-    *   **[CyberChef](https://gchq.github.io/CyberChef/) :** le couteau suisse pour enchaîner les conversions (Base64, Hex, XOR...).
+    *   **CyberChef (copie hors ligne)** : le couteau suisse pour enchaîner les conversions (Base64, Hex, XOR...).
     *   **[RsaCtfTool](https://github.com/RsaCtfTool/RsaCtfTool) :** script Python pour attaquer des clés RSA mal générées ou faibles.
     *   **[Hashcat](https://hashcat.net/hashcat/) / [John the Ripper](https://www.openwall.com/john/) :** craquent des condensats (hashes) avec la célèbre wordlist `rockyou.txt` (dans `/usr/share/wordlists/` sous Kali).
+        ```bash
+        # Exemple avec un hash MD5 (ici celui d'une chaîne vide) :
+        echo 31d6cfe0d16ae931b73c59d7e0c089c0 > hash.txt
+
+        hashcat -m 0 hash.txt /usr/share/wordlists/rockyou.txt   # -m 0 = MD5, -m 1000 = NTLM, -m 100 = SHA1...
+        hashcat -m 0 hash.txt --show                              # réaffiche le résultat déjà cassé
+
+        john --format=raw-md5 --wordlist=/usr/share/wordlists/rockyou.txt hash.txt
+        john --show hash.txt                                      # réaffiche le résultat déjà cassé
+
+        rm hash.txt   # nettoyage une fois fini
+        ```
+        Le résultat cassé reste aussi en cache (potfile) même après `rm hash.txt` : `~/.hashcat/hashcat.potfile` pour Hashcat, `~/.john/john.pot` pour John. Supprime-les aussi si tu veux repartir de zéro sur le même hash.
+        Les raccourcis `Hashcat - Crack Hashes` et `John - Crack Passwords` (dossier `06-Cryptanalyse`) affichent ces commandes au démarrage du terminal Kali.
     *   **[SageMath](https://www.sagemath.org/) :** pour les épreuves RSA et courbes elliptiques avancées (installation optionnelle, lourde).
 *   **Concepts à maîtriser :** chiffrement asymétrique (RSA), symétrique (AES ECB vs CBC), opérations XOR, fonctions de hachage (MD5, SHA).
 

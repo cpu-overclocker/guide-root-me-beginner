@@ -40,6 +40,30 @@ try {
     Write-Host "[configuration] Adding Windows Defender exclusion for the Tools folder..." -ForegroundColor Cyan
     Add-MpPreference -ExclusionPath $Tools -ErrorAction SilentlyContinue
 
+    # Smart App Control (SAC) blocks unsigned installers (ExifTool, x64dbg, Cutter...).
+    # It has no exclusion list, only On / Evaluation / Off, so the script only warns.
+    # 0 = off, 1 = on (blocks), 2 = evaluation (does not block)
+    $sacOn = $false
+    $sacWasOn = $false
+    try {
+        $sac = (Get-ItemProperty "HKLM:\SYSTEM\CurrentControlSet\Control\CI\Policy" -ErrorAction Stop).VerifiedAndReputablePolicyState
+        if ($sac -eq 1) { $sacOn = $true }
+    } catch {}
+    if ($sacOn) {
+        Write-Host "[warning] Smart App Control is ON: unsigned installers will be blocked." -ForegroundColor Yellow
+        Write-Host "          There is no exclusion for it. To let the script finish, open Windows Security," -ForegroundColor Yellow
+        Write-Host "          App and browser control, Smart App Control settings, choose Off, then run the script again." -ForegroundColor Yellow
+        Write-Host "          You can turn it back on afterwards on an up to date Windows 11." -ForegroundColor Yellow
+        $sacWasOn = $true
+        Start-Process "windowsdefender://appbrowser" -ErrorAction SilentlyContinue
+        Read-Host "Turn Smart App Control Off in the window that just opened, then press Enter here to continue (Enter alone continues with it on)"
+        try {
+            $sac = (Get-ItemProperty "HKLM:\SYSTEM\CurrentControlSet\Control\CI\Policy" -ErrorAction Stop).VerifiedAndReputablePolicyState
+            $sacOn = ($sac -eq 1)
+        } catch {}
+        if (-not $sacOn) { Write-Host "[ok] Smart App Control is no longer blocking." -ForegroundColor Green }
+    }
+
     $wslExe = "$env:windir\System32\wsl.exe"
     $psExe  = "$env:windir\System32\WindowsPowerShell\v1.0\powershell.exe"
     $ok = @(); $deja = @(); $echec = @()
@@ -207,7 +231,7 @@ try {
 #!/bin/bash
 export DEBIAN_FRONTEND=noninteractive
 FAIL=0
-PKGS="git curl wget file xxd python3-pip python3-venv build-essential ruby-dev steghide binwalk foremost libimage-exiftool-perl gobuster ffuf john hashcat gdb ltrace strace netcat-traditional exploitdb metasploit-framework sqlmap radare2 python3-pwntools wordlists seclists__SAGE__"
+PKGS="git curl wget file xxd python3-pip python3-venv build-essential ruby-dev steghide binwalk foremost libimage-exiftool-perl gobuster ffuf john hashcat gdb ltrace strace netcat-traditional exploitdb metasploit-framework sqlmap radare2 python3-pwntools python3-scapy wordlists seclists__SAGE__"
 
 # apt: install only the packages that are missing, one by one so a single failure does not block the rest
 MISSING=""
@@ -318,6 +342,9 @@ exit $FAIL
         if ($got) { $ok += "Stegsolve" } else { $echec += "Stegsolve" }
     }
 
+    # ---------- 5b. CyberChef (offline copy, one HTML file, opens in the browser) ----------
+    Install-GitHubZip "CyberChef" "gchq/CyberChef" "CyberChef_*.zip" "$Tools\CyberChef" "CyberChef_*.html"
+
     # ---------- 6. Ghidra, Cutter, Autopsy (GitHub releases) ----------
     Install-GitHubZip "Ghidra" "NationalSecurityAgency/ghidra" "*.zip" "$Tools\Ghidra" "ghidraRun.bat"
     Install-GitHubZip "Cutter" "rizinorg/cutter" "*Windows*x86_64*.zip" "$Tools\Cutter" "cutter.exe"
@@ -380,11 +407,65 @@ foreach ($f in $Files) {
 }
 '@
 
+    # Decode a raw hex frame dump (Ethernet/IP/TCP/UDP...) pasted interactively, using Scapy.
+    # Used by the "Scapy - Decode Hex Frame" shortcut below.
+    Set-Content -Path "$Tools\hexframe.py" -Encoding UTF8 -Value @'
+#!/usr/bin/env python3
+"""Paste a raw hex frame dump (the kind of "00 05 73 a0 ..." block Root-Me gives you for
+network challenges), then press Enter on an empty line (or Ctrl+D) to decode it.
+Shows every layer Scapy recognizes (Ethernet, IP/IPv6, TCP/UDP...) and, if there is a
+payload, prints it as text too (useful for HTTP/FTP/Telnet-style challenges)."""
+import sys
+from scapy.all import Ether
+
+print("Paste the hex bytes below (spaces/newlines are both fine).")
+print("Press Enter on an empty line, or Ctrl+D, when you are done:\n")
+lines = []
+for line in sys.stdin:
+    line = line.strip()
+    if not line:
+        break
+    lines.append(line)
+
+hexstr = "".join(lines).replace(" ", "")
+try:
+    data = bytes.fromhex(hexstr)
+except ValueError as e:
+    print(f"Could not parse that as hex: {e}")
+    sys.exit(1)
+
+pkt = Ether(data)
+print("\n========== Decoded layers ==========")
+pkt.show()
+
+if pkt.haslayer("Raw"):
+    print("========== Payload as text ==========")
+    print(pkt["Raw"].load.decode(errors="replace"))
+'@
+
     $manquants = @()
     $ws = New-Object -ComObject WScript.Shell
     $distro = Get-Distro
     $dArg = if ($distro) { "-d $distro --" } else { "--" }
     $WorkWsl = "/mnt/" + $Work.Substring(0,1).ToLower() + $Work.Substring(2).Replace("\", "/")
+    $ToolsWsl = "/mnt/" + $Tools.Substring(0,1).ToLower() + $Tools.Substring(2).Replace("\", "/")
+
+    # Helper for the "Scapy - Decode Hex Frame" shortcut: makes sure python3-scapy is installed
+    # in Kali (silently, as root via "wsl -u root" - this needs no Linux user password at all,
+    # since WSL lets Windows pick the Linux user directly) before running hexframe.py.
+    if ($distro) {
+        $decodeScript = @"
+[Console]::OutputEncoding = [Text.Encoding]::UTF8
+Write-Host "Scapy - Decode Hex Frame" -ForegroundColor Green
+Write-Host "Making sure python3-scapy is installed in Kali (runs as root, no password needed)..." -ForegroundColor DarkGray
+& "$wslExe" -d $distro -u root -- bash -c "dpkg -s python3-scapy >/dev/null 2>&1 || (apt-get update -y >/dev/null 2>&1; apt-get install -y python3-scapy >/dev/null 2>&1)"
+Write-Host ""
+Write-Host "Paste a raw hex frame dump (Root-Me network challenges), it gets decoded automatically."
+Write-Host ""
+& "$wslExe" -d $distro -- bash -c "cd '$WorkWsl'; python3 '$ToolsWsl/hexframe.py'; exec bash"
+"@
+        Set-Content -Path "$Tools\decode_hex_frame.ps1" -Encoding UTF8 -Value $decodeScript
+    }
 
     # Folders added to PATH inside the shortcut terminals (exiftool, nmap, java, python scripts)
     $extra = @()
@@ -453,7 +534,9 @@ foreach ($f in $Files) {
     }
     # Kali terminal: banner with an example, opens in the Workspace folder
     function Add-Wsl($cat, $label, $example, $run) {
-        $inner = "cd '$WorkWsl'; echo '$label'; echo 'Example: $example'; echo; "
+        $inner = "cd '$WorkWsl'; echo '$label'; "
+        if ($example) { $inner += "echo 'Example: $example'; " }
+        $inner += "echo; "
         if ($run) { $inner += "$run; " }
         $inner += "exec bash"
         New-Lnk (Join-Path (Get-Cat $cat) "$label.lnk") $wslExe "$dArg bash -c `"$inner`""
@@ -463,6 +546,13 @@ foreach ($f in $Files) {
     }
     function Add-Url($cat, $label, $url) {
         Set-Content -Path (Join-Path (Get-Cat $cat) "$label.url") -Value "[InternetShortcut]`r`nURL=$url" -Encoding ASCII
+    }
+    # CyberChef: offline copy only. If the zip was not downloaded, a .txt with the
+    # GitHub releases link is created instead (no online fallback: see Install-GitHubZip above).
+    function Add-CyberChef($cat) {
+        $html = Get-ChildItem "$Tools\CyberChef" -Recurse -Filter "CyberChef_*.html" -ErrorAction SilentlyContinue | Select-Object -First 1
+        if ($html) { New-Lnk (Join-Path (Get-Cat $cat) "CyberChef - Data Conversion.lnk") $html.FullName "" }
+        else { Add-Missing $cat "CyberChef - Data Conversion" "https://github.com/gchq/CyberChef/releases/latest" "Download the CyberChef_*.zip asset, unzip it into $Tools\CyberChef, then run the script again." }
     }
     # VS Code opened directly on the Workspace folder
     function Add-VSCode($cat) {
@@ -494,13 +584,18 @@ foreach ($f in $Files) {
     $c = "03-Programming${sep}Programmation"
     Add-VSCode $c
     Add-Cmd $c "Pwntools - Network Scripting" "from pwn import * then remote(host, port)" "pwn version"
-    Add-Url $c "CyberChef - Data Conversion" "https://gchq.github.io/CyberChef/"
+    Add-CyberChef $c
 
     $c = "04-Network${sep}Reseau"
     Add-App $c "Wireshark - Packet Analysis" "*Wireshark*" "Wireshark.exe" "https://www.wireshark.org/download.html" ""
     Add-Cmd $c "Nmap - Port Scan" "nmap -sV -p- target" "nmap --version"
     Add-Wsl $c "Netcat - TCP Connections" "nc host port" "nc -h 2>&1 | head -n 3"
     Add-Cmd $c "Scapy - Packet Forging" "sniff(count=5) then packets.summary()" "scapy"
+    if ($distro) {
+        New-Lnk (Join-Path (Get-Cat $c) "Scapy - Decode Hex Frame.lnk") $psExe "-NoExit -ExecutionPolicy Bypass -File `"$Tools\decode_hex_frame.ps1`""
+    } else {
+        Add-Missing $c "Scapy - Decode Hex Frame" "" "No WSL distro found: install Kali first, then run the script again."
+    }
 
     $c = "05-Web-Server${sep}Web-Serveur"
     Add-App $c "Burp - HTTP Proxy" "*Burp*" "BurpSuiteCommunity.exe" "https://portswigger.net/burp/communitydownload" ""
@@ -510,11 +605,11 @@ foreach ($f in $Files) {
     Add-Dossier $c "Payloads - Payload Library" "$Tools\PayloadsAllTheThings" "https://github.com/swisskyrepo/PayloadsAllTheThings"
 
     $c = "06-Cryptanalysis${sep}Cryptanalyse"
-    Add-Url $c "CyberChef - Data Conversion" "https://gchq.github.io/CyberChef/"
+    Add-CyberChef $c
     Add-Url $c "dCode - Classic Ciphers" "https://www.dcode.fr/"
     Add-Dossier $c "RsaCtfTool - Break RSA" "$Tools\RsaCtfTool" "https://github.com/RsaCtfTool/RsaCtfTool"
-    Add-Wsl $c "Hashcat - Crack Hashes" "hashcat -m 0 hash.txt /usr/share/wordlists/rockyou.txt" "hashcat --version"
-    Add-Wsl $c "John - Crack Passwords" "john --wordlist=/usr/share/wordlists/rockyou.txt hashes.txt" "john | head -n 1"
+    Add-Wsl $c "Hashcat - Crack Hashes" "" "printf '  1. echo 31d6cfe0d16ae931b73c59d7e0c089c0 > hash.txt\n  2. hashcat -m 0 hash.txt /usr/share/wordlists/rockyou.txt\n       -m sets the hash type: 0=MD5  100=SHA1  1000=NTLM  1800=sha512crypt   (-a 3 = brute-force mode)\n  3. hashcat -m 0 hash.txt --show\n       re-shows a hash already cracked, does not re-crack it\n  4. rm hash.txt\n       cleanup once done; the cracked password stays cached in ~/.hashcat/hashcat.potfile,\n       delete that file too if you want --show to really forget it\n\n'; hashcat --version"
+    Add-Wsl $c "John - Crack Passwords" "" "printf '  1. echo 31d6cfe0d16ae931b73c59d7e0c089c0 > hash.txt\n  2. john --format=raw-md5 --wordlist=/usr/share/wordlists/rockyou.txt hash.txt\n       omit --format and John auto-detects the hash type (slower); --list=formats shows all names\n  3. john --show hash.txt\n       re-shows a hash already cracked, does not re-crack it\n  4. rm hash.txt\n       cleanup once done; the cracked password stays cached in ~/.john/john.pot,\n       delete that file too if you want --show to really forget it\n\n'; john --version 2>&1 | head -n 1"
     Add-Wsl $c "Wordlists - rockyou and SecLists" "ls /usr/share/wordlists" "ls /usr/share/wordlists | head -n 20"
     if ($InstallSage) { Add-Wsl $c "SageMath - Math for Crypto" "sage then factor(N)" "sage" }
 
@@ -562,6 +657,14 @@ foreach ($f in $Files) {
     Write-Host "Installed : $($ok -join ', ')"
     Write-Host "Already   : $($deja -join ', ')"
     if ($echec) { Write-Host "Failed    : $($echec -join ', ')" -ForegroundColor Red }
+    if ($sacOn -and $echec) { Write-Host "Smart App Control is on: failures above may come from blocked unsigned installers." -ForegroundColor Yellow }
+    if ($sacWasOn) {
+        Write-Host ""
+        Write-Host "Smart App Control was on before the script. Turn it back on now:" -ForegroundColor Yellow
+        Write-Host "Windows Security, App and browser control, Smart App Control settings, then On." -ForegroundColor Yellow
+        Write-Host "Warning: once it is on again, unsigned tools (ExifTool, x64dbg, Cutter...) may be blocked at launch." -ForegroundColor Yellow
+        Start-Process "windowsdefender://appbrowser" -ErrorAction SilentlyContinue
+    }
 }
 catch {
     Write-Host ""
