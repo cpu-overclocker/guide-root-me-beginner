@@ -32,7 +32,12 @@ try {
     $Tools   = "$Dossier\Tools"           # downloaded tools go here
     $Work    = "$Dossier\Workspace"        # drop challenge files here
     $Racine  = "$Dossier\Categories"       # category folders with shortcuts
-    New-Item -ItemType Directory -Force -Path $Dossier, $Tools, $Work, $Racine | Out-Null
+    New-Item -ItemType Directory -Force -Path $Dossier, $Tools, $Work | Out-Null
+    # Categories only holds shortcuts/links/.txt notes, never your tools or challenge files,
+    # so it is safe to wipe and rebuild it fresh every run - this is what prevents old
+    # shortcuts (from a previous version of this script) from piling up next to new ones.
+    if (Test-Path $Racine) { Remove-Item $Racine -Recurse -Force -ErrorAction SilentlyContinue }
+    New-Item -ItemType Directory -Force -Path $Racine | Out-Null
     Set-Location $Dossier
 
     # Only the Tools folder is excluded (PEASS, BeEF... are flagged as malware by Defender).
@@ -231,7 +236,7 @@ try {
 #!/bin/bash
 export DEBIAN_FRONTEND=noninteractive
 FAIL=0
-PKGS="git curl wget file xxd python3-pip python3-venv build-essential ruby-dev steghide binwalk foremost libimage-exiftool-perl gobuster ffuf john hashcat gdb ltrace strace netcat-traditional exploitdb metasploit-framework sqlmap radare2 python3-pwntools python3-scapy wordlists seclists__SAGE__"
+PKGS="git curl wget file xxd python3-pip python3-venv build-essential ruby-dev steghide binwalk foremost libimage-exiftool-perl gobuster ffuf john hashcat gdb ltrace strace netcat-traditional exploitdb metasploit-framework sqlmap radare2 python3-pwntools python3-scapy wordlists seclists jadx apktool aapt__SAGE__"
 
 # apt: install only the packages that are missing, one by one so a single failure does not block the rest
 MISSING=""
@@ -409,7 +414,7 @@ foreach ($f in $Files) {
 
     # Decode a raw hex frame dump (Ethernet/IP/TCP/UDP...) pasted interactively, using Scapy.
     # Used by the "Scapy - Decode Hex Frame" shortcut below.
-    Set-Content -Path "$Tools\hexframe.py" -Encoding UTF8 -Value @'
+    $hexframePy = @'
 #!/usr/bin/env python3
 """Paste a raw hex frame dump (the kind of "00 05 73 a0 ..." block Root-Me gives you for
 network challenges), then press Enter on an empty line (or Ctrl+D) to decode it.
@@ -442,6 +447,145 @@ if pkt.haslayer("Raw"):
     print("========== Payload as text ==========")
     print(pkt["Raw"].load.decode(errors="replace"))
 '@
+    # Written without a BOM and with LF-only line endings: a BOM at the start of a shebang
+    # line makes bash try to execute "#!/bin/bash" as a literal command instead of treating
+    # it as a comment, and breaks some interpreters' first-line parsing too.
+    [IO.File]::WriteAllText("$Tools\hexframe.py", ($hexframePy -replace "`r`n", "`n"))
+
+    # All-in-one, step-by-step APK/XAPK recon: unzips xapk if needed, dumps the manifest,
+    # decompiles with jadx, and tells you exactly where everything landed and what to do next.
+    # Used by the "Android - Full Recon (guided)" shortcut below.
+    $androidReconSh = @'
+#!/bin/bash
+# Guided, in-order recon of an .apk or .xapk file. Run it, type the file name
+# (it must be in this Workspace folder), and it does everything in the right order.
+set -uo pipefail
+echo "=================================================================="
+echo " Android recon - guided, step by step"
+echo "=================================================================="
+echo
+echo "Files currently in this folder:"
+ls -1 -- *.apk *.xapk 2>/dev/null
+echo
+read -rp "Type the .apk or .xapk file name to analyze: " INPUT
+if [ ! -f "$INPUT" ]; then
+    echo "File not found: $INPUT (it must be in this Workspace folder, drop it there first)"
+    exit 1
+fi
+
+ORIGINAL_DIR="$(pwd)"
+BASENAME="$(basename "$INPUT")"
+NAME="${BASENAME%.*}"
+APK="$INPUT"
+
+# Windows drives mounted in WSL (/mnt/c/...) use the 9p protocol, which some Java tools
+# (jadx in particular) cannot reliably create nested directories on. Do all the real work
+# on Kali's own native filesystem instead, then copy the results back to Workspace at the end.
+WORKDIR="$HOME/.rootme-android-work/$NAME"
+rm -rf "$WORKDIR"
+mkdir -p "$WORKDIR"
+cp "$INPUT" "$WORKDIR/"
+cd "$WORKDIR" || exit 1
+INPUT="$BASENAME"
+APK="$INPUT"
+
+# Step 0: if it's an XAPK (a zip with the real apk inside), unzip it and find the base apk
+if [[ "$INPUT" == *.xapk ]]; then
+    echo
+    echo "---------------------------------------------------------------"
+    echo "STEP 0: .xapk detected -> unzipping it (it's just a zip of apks)"
+    echo "---------------------------------------------------------------"
+    EXTRACT_DIR="${NAME}_extracted"
+    mkdir -p "$EXTRACT_DIR"
+    unzip -o -q "$INPUT" -d "$EXTRACT_DIR"
+    echo "Extracted into: $EXTRACT_DIR"
+    echo "Contents:"
+    ls -1 "$EXTRACT_DIR"
+    APK=$(find "$EXTRACT_DIR" -iname "base.apk" -o -iname "*.apk" ! -iname "config.*" | head -n 1)
+    if [ -z "$APK" ]; then APK=$(find "$EXTRACT_DIR" -iname "*.apk" | head -n 1); fi
+    echo
+    echo ">>> Using this file as the main APK for the rest: $APK"
+    echo "    (the other config.*.apk files are just language/CPU splits, usually no code of interest)"
+fi
+
+# jadx's own wrapper script changes directory internally before running, which breaks a
+# relative path - always use an absolute path for every tool from here on.
+APK="$(realpath "$APK")"
+
+# Step 1: aapt - quick identity card of the app (permissions, exported components)
+echo
+echo "---------------------------------------------------------------"
+echo "STEP 1: aapt - manifest summary (permissions, exported components)"
+echo "---------------------------------------------------------------"
+aapt dump badging "$APK" > "${NAME}_aapt.txt" 2>&1
+echo "Saved to: ${NAME}_aapt.txt"
+echo
+echo "Permissions requested:"
+grep -i "uses-permission" "${NAME}_aapt.txt" | sed 's/^/  /'
+echo
+echo "Exported components (the first thing to check for an easy attack surface):"
+grep -i "exported" "${NAME}_aapt.txt" | sed 's/^/  /'
+if ! grep -qi "exported" "${NAME}_aapt.txt"; then
+    echo "  (aapt didn't print any directly here - open ${NAME}_aapt.txt and check the full"
+    echo "   AndroidManifest.xml from apktool in step 3 if you need the exported= flags precisely)"
+fi
+
+# Step 2: jadx - decompile to readable Java (the main step, read this first)
+echo
+echo "---------------------------------------------------------------"
+echo "STEP 2: jadx - decompiling to readable Java (this is the main step)"
+echo "---------------------------------------------------------------"
+rm -rf "${NAME}_jadx"
+jadx -d "${NAME}_jadx" "$APK" > "${NAME}_jadx.log" 2>&1
+if [ -d "${NAME}_jadx/sources" ]; then
+    echo "Decompiled Java code is in: ${NAME}_jadx/sources/"
+    echo "Open that folder in VS Code to read it, or search it directly, e.g.:"
+    echo "  grep -ri 'password\|secret\|api_key\|token' -r ${NAME}_jadx/sources/"
+else
+    echo "jadx did not produce sources (see ${NAME}_jadx.log) - this is normal for heavily"
+    echo "obfuscated or packed apps. Move on to apktool (step 3) for the smali instead."
+fi
+
+# Step 3: apktool - smali + raw resources, as a fallback / for patching
+echo
+echo "---------------------------------------------------------------"
+echo "STEP 3: apktool - smali + raw resources (fallback, or to patch and rebuild)"
+echo "---------------------------------------------------------------"
+echo "(on the very first run, apktool downloads an Android framework file from the internet"
+echo " the first time it needs it - this can take a minute with no output, that's normal)"
+apktool d -f -o "${NAME}_apktool" "$APK" > "${NAME}_apktool.log" 2>&1
+if [ -d "${NAME}_apktool" ]; then
+    echo "Unpacked into: ${NAME}_apktool/"
+    echo "  ${NAME}_apktool/AndroidManifest.xml   -> full manifest, readable"
+    echo "  ${NAME}_apktool/smali*/                -> bytecode, use only if jadx's Java was unreadable"
+    echo "  ${NAME}_apktool/res/                    -> app resources (strings, layouts...)"
+    echo "To repack after editing: apktool b ${NAME}_apktool -o patched.apk"
+else
+    echo "apktool failed (see ${NAME}_apktool.log)"
+fi
+
+# Copy everything back next to the original file in Workspace, so you can see/open it
+# from Windows too, then clean up the native-filesystem working copy.
+RESULT_DIR="${ORIGINAL_DIR}/${NAME}_results"
+rm -rf "$RESULT_DIR"
+mkdir -p "$RESULT_DIR"
+cp -r "$WORKDIR"/* "$RESULT_DIR/" 2>/dev/null
+rm -f "$RESULT_DIR/$BASENAME"   # no need to duplicate the original apk/xapk
+cd "$ORIGINAL_DIR" || exit 1
+rm -rf "$WORKDIR"
+
+echo
+echo "=================================================================="
+echo " DONE. Everything was copied into: ${NAME}_results/"
+echo " Suggested order to actually look at things:"
+echo "   1. ${NAME}_results/${NAME}_aapt.txt                    - permissions & exported components"
+echo "   2. ${NAME}_results/${NAME}_jadx/sources/                - read the real code here first"
+echo "   3. ${NAME}_results/${NAME}_apktool/AndroidManifest.xml  - only if you need manifest details aapt missed"
+echo "   4. ${NAME}_results/${NAME}_apktool/smali*/               - only if jadx's Java was broken/unreadable"
+echo "=================================================================="
+'@
+    # Same no-BOM / LF-only fix as hexframe.py above.
+    [IO.File]::WriteAllText("$Tools\android_recon.sh", ($androidReconSh -replace "`r`n", "`n"))
 
     $manquants = @()
     $ws = New-Object -ComObject WScript.Shell
@@ -645,6 +789,9 @@ Write-Host ""
     Add-Wsl $c "Searchsploit - Exploit Search" "searchsploit apache 2.4" "searchsploit -h | head -n 5"
     Add-Cmd $c "Nmap - Port Scan" "nmap -sV -p- target" "nmap --version"
     Add-App $c "Burp - HTTP Proxy" "*Burp*" "BurpSuiteCommunity.exe" "https://portswigger.net/burp/communitydownload" ""
+
+    $c = "12-Other${sep}Autres"
+    Add-Wsl $c "Android - Reverse an APK (start here)" "" "echo 'Drop your .apk or .xapk into this Workspace folder first, then run this.'; echo 'It will unzip it if needed, run aapt + jadx + apktool in the right order,'; echo 'and tell you exactly where to look and in what order. Just answer the prompt below.'; echo; bash '$ToolsWsl/android_recon.sh'"
 
     Write-Host "Shortcuts in: $Racine" -ForegroundColor Green
     if ($manquants) { Write-Host "Missing (a .txt with the download link was created instead): $(($manquants | Select-Object -Unique) -join ', ')" -ForegroundColor Yellow }
